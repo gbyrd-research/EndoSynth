@@ -5,8 +5,6 @@ from torchvision.transforms import Compose
 from torchvision.transforms import Normalize
 import torch.nn.functional as F
 import cv2
-from typing import Optional
-import types
 import sys
 
 # Vendored Depth-Anything repos live under EndoSynth/third_party/ (not installed as packages).
@@ -78,7 +76,7 @@ class Wrapper(object):
         transform = Compose(transforms)
 
         h, w = x.shape[:2]
-        image = cv2.cvtColor(x, cv2.COLOR_BGR2RGB) / 255.0
+        image = cv2.cvtColor(x, cv2.COLOR_RGB2BGR) / 255.0
         image = transform({"image": image})["image"]
         image = torch.from_numpy(image).unsqueeze(0)
         image = image.to(self.device)
@@ -115,6 +113,7 @@ class DAv1(Wrapper):
 class DAv2(Wrapper):
     def __init__(self, device: torch.device | str):
         super().__init__(device)
+        self.MULTIPLE = 14
         config = dict(encoder="vitb", features=128, out_channels=[96, 192, 384, 768])
         self._model = DepthAnythingV2(**config)
         self.act = DepthAnythingAct("v2")
@@ -137,61 +136,117 @@ class DAv2(Wrapper):
         return depth.cpu().numpy().squeeze()
 
 
-class EndoDAC(Wrapper):
-    def __init__(self, device: torch.device | str):
-        super().__init__(device)
-        self._model = endodac(
-            backbone_size="base",
-            r=4,
-            lora_type="dvlora",
-            image_shape=(224, 280),
-            pretrained_path=None,
-            residual_block_indexes=[2, 5, 8, 11],
-            include_cls_token=True,
+    def constrain_to_multiple_of(self, x, min_val=0, max_val=None):
+        y = (np.round(x / self.MULTIPLE) * self.MULTIPLE).astype(int)
+
+        if max_val is not None and y > max_val:
+            y = (np.floor(x / self.MULTIPLE) * self.MULTIPLE).astype(int)
+
+        if y < min_val:
+            y = (np.ceil(x / self.MULTIPLE) * self.MULTIPLE).astype(int)
+
+        return y
+
+    @torch.no_grad()
+    def infer_tensor(self, img: torch.Tensor) -> torch.Tensor:
+
+        DEPTH_ANYTHING_TARGET_HEIGHT = 420
+        DEPTH_ANYTHING_TARGET_WIDTH = 742
+
+        if img.dtype != torch.uint8:
+            raise Exception(f"Image expected to be of type torch.uint8. Instead got {img.dtype}")
+
+        if img.ndim != 4 or img.shape[1] != 3:
+            raise Exception("image expected in [B, C, H, W] format with 3 channels")
+
+        img = img[:, [2, 1, 0], :, :] # RGB TO BGR
+        img = img.float() / 255.0
+
+        # resize
+        img_h, img_w = img.shape[2], img.shape[3]
+        scale_height = DEPTH_ANYTHING_TARGET_HEIGHT / img_h
+        scale_width = DEPTH_ANYTHING_TARGET_WIDTH / img_w
+        new_height = self.constrain_to_multiple_of(scale_height * img_h, min_val=DEPTH_ANYTHING_TARGET_HEIGHT)
+        new_width = self.constrain_to_multiple_of(scale_width * img_w, min_val=DEPTH_ANYTHING_TARGET_WIDTH)
+
+        resized_img = F.interpolate(
+            img,
+            size=(new_height, new_width),
+            mode="bilinear",
+            align_corners=False,
         )
 
-    def load(self, path: str):
-        ckpt = torch.load(path)
-        state_dict = self._model.state_dict()
-        self._model.load_state_dict({k: v for k, v in ckpt.items() if k in state_dict})
+        mean = torch.tensor([0.485, 0.456, 0.406], device=resized_img.device, dtype=resized_img.dtype).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=resized_img.device, dtype=resized_img.dtype).view(1, 3, 1, 1)
 
-    @torch.no_grad()
-    def infer(self, x: np.ndarray) -> np.ndarray:
-        x, (h, w) = self.to_tensor(x, 742, 420)
-        disp = self._model(x)[("disp", 0)]
-        disp = F.interpolate(disp, size=(h, w), mode="bilinear", align_corners=True)
-        min_disp = 1 / MAX_DEPTH
-        max_disp = 1 / 0.001
-        depth = 1 / (min_disp + (max_disp - min_disp) * disp)
-        return depth.cpu().numpy().squeeze()
+        resized_img = (resized_img - mean) / std
+        
+        patch_h, patch_w = new_height // 14, new_width // 14
+        features = self._model.pretrained.get_intermediate_layers(resized_img, [2, 5, 8, 11], return_class_token=True)
+        logits = self._model.depth_head(features, patch_h, patch_w)
+
+        depth = self.act(logits) * MAX_DEPTH
+        depth = F.interpolate(depth, (img_h, img_w), mode="bilinear", align_corners=True)
+
+        return depth
+
+# Not using these, so commenting out...
+
+# class EndoDAC(Wrapper):
+#     def __init__(self, device: torch.device | str):
+#         super().__init__(device)
+#         self._model = endodac(
+#             backbone_size="base",
+#             r=4,
+#             lora_type="dvlora",
+#             image_shape=(224, 280),
+#             pretrained_path=None,
+#             residual_block_indexes=[2, 5, 8, 11],
+#             include_cls_token=True,
+#         )
+
+#     def load(self, path: str):
+#         ckpt = torch.load(path)
+#         state_dict = self._model.state_dict()
+#         self._model.load_state_dict({k: v for k, v in ckpt.items() if k in state_dict})
+
+#     @torch.no_grad()
+#     def infer(self, x: np.ndarray) -> np.ndarray:
+#         x, (h, w) = self.to_tensor(x, 742, 420)
+#         disp = self._model(x)[("disp", 0)]
+#         disp = F.interpolate(disp, size=(h, w), mode="bilinear", align_corners=True)
+#         min_disp = 1 / MAX_DEPTH
+#         max_disp = 1 / 0.001
+#         depth = 1 / (min_disp + (max_disp - min_disp) * disp)
+#         return depth.cpu().numpy().squeeze()
 
 
-class Midas(Wrapper):
-    def __init__(self, device: torch.device | str):
-        super().__init__(device)
-        self._model = DPTDepthModel(
-            path=None, backbone="beitl16_512", non_negative=True
-        )        
-        self.normaliser = Normalize(0.5, 0.5)
-        self.ALPHA = 70000
+# class Midas(Wrapper):
+#     def __init__(self, device: torch.device | str):
+#         super().__init__(device)
+#         self._model = DPTDepthModel(
+#             path=None, backbone="beitl16_512", non_negative=True
+#         )        
+#         self.normaliser = Normalize(0.5, 0.5)
+#         self.ALPHA = 70000
 
-    def load(self, path: str):
-        ckpt = torch.load(path, map_location="cpu")
-        keys = [k for k in ckpt if "attn.relative_position_index" in k]
-        for k in keys:
-            del ckpt[k]
-        self._model.load_state_dict(ckpt)
+#     def load(self, path: str):
+#         ckpt = torch.load(path, map_location="cpu")
+#         keys = [k for k in ckpt if "attn.relative_position_index" in k]
+#         for k in keys:
+#             del ckpt[k]
+#         self._model.load_state_dict(ckpt)
 
-    @torch.no_grad()
-    def infer(self, x: np.ndarray) -> np.ndarray:
-        x, (h, w) = self.to_tensor(x, 742, 420, normalise=False)
-        x = self.normaliser(x)
-        o = self._model(x)
-        o = F.interpolate(o.unsqueeze(1), size=(h, w), mode="bilinear", align_corners=True)
-        min_disp = 1 / MAX_DEPTH
-        max_disp = 1 / 0.001
-        depth = self.ALPHA / (min_disp + (max_disp - min_disp) * x)
-        return depth.cpu().numpy().squeeze()
+#     @torch.no_grad()
+#     def infer(self, x: np.ndarray) -> np.ndarray:
+#         x, (h, w) = self.to_tensor(x, 742, 420, normalise=False)
+#         x = self.normaliser(x)
+#         o = self._model(x)
+#         o = F.interpolate(o.unsqueeze(1), size=(h, w), mode="bilinear", align_corners=True)
+#         min_disp = 1 / MAX_DEPTH
+#         max_disp = 1 / 0.001
+#         depth = self.ALPHA / (min_disp + (max_disp - min_disp) * x)
+#         return depth.cpu().numpy().squeeze()
 
 
 def load(
@@ -202,10 +257,11 @@ def load(
         model = DAv1(device)
     elif arch == "dav2":
         model = DAv2(device)
-    elif arch == "endodac":
-        model = EndoDAC(device)
-    elif arch == "midas":
-        model = Midas(device)
+    # not using these so commenting out...
+    # elif arch == "endodac":
+    #     model = EndoDAC(device)
+    # elif arch == "midas":
+    #     model = Midas(device)
     if finetuned:
         ckpts_path = Path(__file__).parent.parent / "checkpoints"
         model.load(ckpts_path / f"{arch}-f.pth")
