@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import cv2
 from typing import Optional
 import types
+import sys
 
 # Vendored Depth-Anything repos live under EndoSynth/third_party/ (not installed as packages).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
