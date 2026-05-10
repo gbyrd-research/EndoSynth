@@ -8,6 +8,13 @@ import cv2
 from typing import Optional
 import types
 
+# Vendored Depth-Anything repos live under EndoSynth/third_party/ (not installed as packages).
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+for _subdir in ("Depth-Anything", "Depth-Anything-V2", "EndoDAC", "MiDaS"):
+    _tp = str(_REPO_ROOT / "third_party" / _subdir)
+    if _tp not in sys.path:
+        sys.path.insert(0, _tp)
+
 # DAv1 from https://github.com/LiheYoung/Depth-Anything in .
 from depth_anything.dpt import DPT_DINOv2
 from depth_anything.util.transform import Resize, NormalizeImage, PrepareForNet
@@ -15,11 +22,11 @@ from depth_anything.util.transform import Resize, NormalizeImage, PrepareForNet
 # DAv2 from https://github.com/DepthAnything/Depth-Anything-V2
 from depth_anything_v2.dpt import DepthAnythingV2
 
-# EndoDAC from https://github.com/BeileiCui/EndoDAC
-import models.endodac.endodac as endodac
+# # EndoDAC from https://github.com/BeileiCui/EndoDAC
+# import models.endodac.endodac as endodac
 
-# MiDaS from https://github.com/isl-org/MiDaS
-from midas.dpt_depth import DPTDepthModel
+# # MiDaS from https://github.com/isl-org/MiDaS
+# from midas.dpt_depth import DPTDepthModel
 
 MAX_DEPTH = 0.3
 
